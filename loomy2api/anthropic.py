@@ -179,6 +179,9 @@ def estimate_tokens(text: str) -> int:
 class StreamTranslator:
     """Converts OpenAI SSE chunks into Anthropic SSE events.
 
+    Text and thinking stay live; tool blocks are buffered until finish so
+    metadata is complete and each tool starts and stops before the next one.
+
     Usage::
 
         st = StreamTranslator(model)
@@ -193,14 +196,40 @@ class StreamTranslator:
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.usage: Dict[str, Any] = {}
         self.finish_reason: Optional[str] = None
-        self._text_open = False
-        self._text_index = 0
-        self._think_open = False
+        self._next_index = 0
+        self._content_index: Optional[int] = None
+        self._content_kind: Optional[str] = None
+        self._tools: Dict[Any, Dict[str, Any]] = {}
 
     # -- helpers --------------------------------------------------------
 
     def _ev(self, event: str, data: Dict[str, Any]):
         return event, data
+
+    def _close_content(self) -> Iterable:
+        if self._content_index is not None:
+            yield self._ev("content_block_stop", {
+                "type": "content_block_stop", "index": self._content_index})
+            self._content_index = None
+            self._content_kind = None
+
+    def _tool_events(self, tool: Dict[str, Any]) -> Iterable:
+        # Called only at finish: metadata is complete and tool blocks can
+        # be emitted sequentially even when upstream fragments interleave.
+        if not tool["name"] or not tool["id"]:
+            return
+        if tool["index"] is None:
+            tool["index"] = self._next_index
+            self._next_index += 1
+            yield self._ev("content_block_start", {
+                "type": "content_block_start", "index": tool["index"],
+                "content_block": {"type": "tool_use", "id": tool["id"],
+                                  "name": tool["name"], "input": {}}})
+        for arguments in tool["arguments"]:
+            yield self._ev("content_block_delta", {
+                "type": "content_block_delta", "index": tool["index"],
+                "delta": {"type": "input_json_delta", "partial_json": arguments}})
+        tool["arguments"].clear()
 
     def start(self) -> Iterable:
         yield self._ev("message_start", {
@@ -228,65 +257,53 @@ class StreamTranslator:
         choice = choices[0]
         delta = choice.get("delta") or {}
 
-        thinking = delta.get("reasoning_content")
-        if thinking:
-            if not self._think_open:
-                self._think_open = True
-                yield self._ev("content_block_start", {
-                    "type": "content_block_start", "index": 0,
-                    "content_block": {"type": "thinking", "thinking": ""}})
-            yield self._ev("content_block_delta", {
-                "type": "content_block_delta", "index": 0,
-                "delta": {"type": "thinking_delta", "thinking": thinking}})
-
-        text = delta.get("content")
-        if text:
-            if self._think_open and not self._text_open:
-                self._think_open = False
-                yield self._ev("content_block_stop", {
-                    "type": "content_block_stop", "index": 0})
-            if not self._text_open:
-                self._text_open = True
-                self._text_index = 0
-                yield self._ev("content_block_start", {
-                    "type": "content_block_start", "index": self._text_index,
-                    "content_block": {"type": "text", "text": ""}})
-            yield self._ev("content_block_delta", {
-                "type": "content_block_delta", "index": self._text_index,
-                "delta": {"type": "text_delta", "text": text}})
-
-        # tool calls are streamed as complete blocks (upstream sends them whole)
-        for call in delta.get("tool_calls") or []:
-            fn = call.get("function") or {}
-            if not fn.get("name"):
+        for kind, value in (("thinking", delta.get("reasoning_content")),
+                            ("text", delta.get("content"))):
+            if not value:
                 continue
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except Exception:                           # noqa: BLE001
-                args = {}
-            index = self._text_index + 1 if self._text_open else 0
-            yield self._ev("content_block_start", {
-                "type": "content_block_start", "index": index,
-                "content_block": {"type": "tool_use",
-                                  "id": call.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                                  "name": fn["name"], "input": {}}})
+            if self._content_kind != kind:
+                yield from self._close_content()
+                self._content_kind = kind
+                self._content_index = self._next_index
+                self._next_index += 1
+                yield self._ev("content_block_start", {
+                    "type": "content_block_start", "index": self._content_index,
+                    "content_block": {"type": kind, kind: ""}})
             yield self._ev("content_block_delta", {
-                "type": "content_block_delta", "index": index,
-                "delta": {"type": "input_json_delta",
-                          "partial_json": json.dumps(args, ensure_ascii=False)}})
-            yield self._ev("content_block_stop", {
-                "type": "content_block_stop", "index": index})
+                "type": "content_block_delta", "index": self._content_index,
+                "delta": {"type": kind + "_delta", kind: value}})
+
+        for call in delta.get("tool_calls") or []:
+            yield from self._close_content()
+            fn = call.get("function") or {}
+            # Standard fragments identify their tool by index; whole calls
+            # without an index can still be distinguished by ID.
+            if call.get("index") is not None:
+                key = ("index", call["index"])
+            elif call.get("id"):
+                key = ("id", call["id"])
+            else:
+                key = ("anonymous", len(self._tools))
+            tool = self._tools.setdefault(key, {
+                "id": None, "name": None, "index": None, "arguments": []})
+            if call.get("id"):
+                tool["id"] = (tool["id"] or "") + call["id"]
+            if fn.get("name"):
+                tool["name"] = (tool["name"] or "") + fn["name"]
+            if fn.get("arguments"):
+                tool["arguments"].append(fn["arguments"])
 
         self.finish_reason = choice.get("finish_reason") or self.finish_reason
 
     def finish(self) -> Iterable:
-        if self._think_open:
-            self._think_open = False
-            yield self._ev("content_block_stop", {"type": "content_block_stop", "index": 0})
-        if self._text_open:
-            self._text_open = False
-            yield self._ev("content_block_stop", {
-                "type": "content_block_stop", "index": self._text_index})
+        yield from self._close_content()
+        for tool in self._tools.values():
+            if not tool["id"]:
+                tool["id"] = f"call_{uuid.uuid4().hex[:12]}"
+            yield from self._tool_events(tool)
+            if tool["index"] is not None:
+                yield self._ev("content_block_stop", {
+                    "type": "content_block_stop", "index": tool["index"]})
         stop_reason = {"length": "max_tokens", "tool_calls": "tool_use"}.get(
             self.finish_reason, "end_turn")
         yield self._ev("message_delta", {

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import random
+import threading
 import time
 import unittest
 
@@ -196,6 +198,42 @@ class TestInflightTracker(unittest.TestCase):
         t.release("a")
         self.assertFalse(t.full("a"))
         self.assertEqual(t.snapshot(), {})
+
+    def test_try_acquire_respects_limit_and_reuses_released_slot(self):
+        tracker = InflightTracker(limit=2)
+        self.assertTrue(tracker.try_acquire("a"))
+        self.assertTrue(tracker.try_acquire("a"))
+        self.assertFalse(tracker.try_acquire("a"))
+        self.assertEqual(tracker.snapshot(), {"a": 2})
+        tracker.release("a")
+        self.assertTrue(tracker.try_acquire("a"))
+        self.assertEqual(tracker.snapshot(), {"a": 2})
+
+    def test_try_acquire_is_atomic(self):
+        tracker = InflightTracker(limit=1)
+        barrier = threading.Barrier(2)
+
+        def acquire(_):
+            barrier.wait(timeout=5)
+            return tracker.try_acquire("a")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(acquire, range(2)))
+        self.assertCountEqual(results, [True, False])
+        self.assertEqual(tracker.snapshot(), {"a": 1})
+
+    def test_try_acquire_unlimited_does_not_track_leases(self):
+        tracker = InflightTracker(limit=0)
+        for _ in range(100):
+            self.assertTrue(tracker.try_acquire("a"))
+        self.assertEqual(tracker.snapshot(), {})
+        self.assertFalse(tracker.full("a"))
+
+    def test_acquire_also_respects_limit(self):
+        tracker = InflightTracker(limit=1)
+        tracker.acquire("a")
+        tracker.acquire("a")
+        self.assertEqual(tracker.snapshot(), {"a": 1})
 
 
 if __name__ == "__main__":

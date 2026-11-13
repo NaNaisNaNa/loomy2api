@@ -1092,7 +1092,7 @@ async function loadModels() {
     if (sel) {
       const prev = sel.value;
       sel.innerHTML = data.models.map((m) => {
-        const label = m.id + (m.multiplier ? '（x' + m.multiplier + '）' : '');
+        const label = m.id + (m.multiplier != null ? '（x' + m.multiplier + '）' : '');
         return '<option value="' + esc(m.id) + '"' +
           (m.id === data.default_model ? ' selected' : '') + '>' + esc(label) + '</option>';
       }).join('');
@@ -1109,13 +1109,8 @@ async function loadModels() {
       if (m.reasoning_efforts && m.reasoning_efforts.length) {
         caps.push('<span class="hint" style="margin:0">档位:' + esc(m.reasoning_efforts.join('/')) + '</span>');
       }
-      // 上游部分模型 multiplier 字段为 null，倍率只写在名称文本里（如 "（x3.0）"）
-      let mult = (m.multiplier === null || m.multiplier === undefined) ? null : Number(m.multiplier);
-      if (mult === null || Number.isNaN(mult)) {
-        const mm = /(?:x|×)([0-9.]+)/i.exec(m.name || '');
-        if (mm) mult = parseFloat(mm[1]);
-      }
-      const multText = (mult === null || Number.isNaN(mult)) ? '—' : ('x' + mult);
+      const mult = m.multiplier ?? null;
+      const multText = mult === null ? '—' : ('x' + mult);
       const pr = LAST_PRICING[m.id];
       const price = pr
         ? ('<b>' + pr.avg + '</b> 分/次 <span class="hint" style="margin:0">(' + pr.calls + ' 次' +

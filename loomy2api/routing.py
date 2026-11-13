@@ -271,11 +271,19 @@ class InflightTracker:
         with self._lock:
             return self._counts.get(name, 0) >= self.limit
 
-    def acquire(self, name: str) -> None:
-        if not self.enabled:
-            return
+    def try_acquire(self, name: str) -> bool:
+        """Atomically reserve a slot; an unlimited tracker always succeeds."""
         with self._lock:
-            self._counts[name] = self._counts.get(name, 0) + 1
+            if not self.enabled:
+                return True
+            current = self._counts.get(name, 0)
+            if current >= self.limit:
+                return False
+            self._counts[name] = current + 1
+            return True
+
+    def acquire(self, name: str) -> bool:
+        return self.try_acquire(name)
 
     def release(self, name: str) -> None:
         if not self.enabled:

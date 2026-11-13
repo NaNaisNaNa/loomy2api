@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -233,6 +235,106 @@ class TestPool(unittest.TestCase):
         # 必须换号：a→b 或 b→a，不许原地踏步
         self.assertNotEqual(acc2.name, acc1.name)
 
+    def test_sticky_honors_quota_and_model_cooldown(self):
+        for state in ("quota_zero", "model_cooled"):
+            with self.subTest(state=state):
+                self._write([{"name": "a", "session": "s1"},
+                             {"name": "b", "session": "s2"}])
+                pool = AccountPool(self.cfg)
+                pool.sticky.bind("conversation", "a")
+                if state == "quota_zero":
+                    pool.get("a").available = 0
+                else:
+                    pool.get("a").model_cooldowns["model"] = {
+                        "until": time.time() + 600}
+                self.assertEqual([a.name for a in pool.usable(model="model")], ["b"])
+                acc = pool.acquire(model="model", session_key_value="conversation")
+                try:
+                    self.assertEqual(acc.name, "b")
+                    self.assertEqual(pool.sticky.get("conversation"), "b")
+                finally:
+                    pool.release(acc)
+
+    def _contended_acquires(self, account_count, sticky):
+        self._write([{"name": name, "session": "s-" + name}
+                     for name in ("a", "b")[:account_count]])
+        self.cfg["strategy"] = "balance"
+        self.cfg["max_inflight_per_account"] = 1
+        pool = AccountPool(self.cfg)
+        pool.get("a").available = 100
+        if account_count > 1:
+            pool.get("b").available = 1
+        key = "conversation" if sticky else None
+        if key:
+            pool.sticky.bind(key, "a")
+        barrier = threading.Barrier(2)
+        real_ensure = pool.ensure_session
+
+        def ensure(acc, **kwargs):
+            # Both callers selected a before either can reserve its slot.
+            # This also detects an accidental global lock around login.
+            if acc.name == "a":
+                barrier.wait(timeout=5)
+            return real_ensure(acc, **kwargs)
+
+        def acquire(_):
+            try:
+                return pool.acquire(session_key_value=key).name
+            except PoolError:
+                return None
+
+        pool.ensure_session = ensure
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            names = list(executor.map(acquire, range(2)))
+        return pool, names
+
+    def test_concurrent_acquire_cannot_exceed_single_account_limit(self):
+        for sticky in (False, True):
+            with self.subTest(sticky=sticky):
+                pool, names = self._contended_acquires(1, sticky)
+                self.assertCountEqual(names, ["a", None])
+                self.assertEqual(pool.inflight.snapshot(), {"a": 1})
+                pool.release(pool.get("a"))
+                self.assertEqual(pool.inflight.snapshot(), {})
+
+    def test_concurrent_acquire_reselects_another_account(self):
+        for sticky in (False, True):
+            with self.subTest(sticky=sticky):
+                pool, names = self._contended_acquires(2, sticky)
+                self.assertCountEqual(names, ["a", "b"])
+                self.assertEqual(pool.inflight.snapshot(), {"a": 1, "b": 1})
+                for name in names:
+                    pool.release(pool.get(name))
+                self.assertEqual(pool.inflight.snapshot(), {})
+
+    def test_all_unhealthy_probe_still_observes_inflight_limit(self):
+        self._write([{"name": "a", "session": "s1"}])
+        self.cfg["max_inflight_per_account"] = 1
+        pool = AccountPool(self.cfg)
+        acc = pool.get("a")
+        acc.available = 0
+        acc.cooldown_until = time.time() + 600
+        acc.model_cooldowns["model"] = {"until": time.time() + 600}
+        pool.sticky.bind("conversation", "a")
+        self.assertEqual(pool.usable(model="model"), [])
+        self.assertIs(pool.acquire(model="model", session_key_value="conversation"), acc)
+        try:
+            with self.assertRaises(PoolError):
+                pool.acquire(model="model", session_key_value="conversation")
+        finally:
+            pool.release(acc)
+        self.assertEqual(pool.inflight.snapshot(), {})
+
+    def test_unlimited_account_allows_repeated_sticky_and_regular_acquires(self):
+        self._write([{"name": "a", "session": "s1"}])
+        self.cfg["max_inflight_per_account"] = 0
+        pool = AccountPool(self.cfg)
+        for key in (None, "conversation"):
+            leases = [pool.acquire(session_key_value=key) for _ in range(5)]
+            self.assertEqual([acc.name for acc in leases], ["a"] * 5)
+            for acc in leases:
+                pool.release(acc)
+        self.assertEqual(pool.inflight.snapshot(), {})
 
 
 class TestSessionLifecycle(unittest.TestCase):

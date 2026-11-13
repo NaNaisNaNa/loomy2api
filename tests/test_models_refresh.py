@@ -18,7 +18,7 @@ class ModelRefreshRecoveryTestCase(unittest.TestCase):
         cfg = make_config(Path(self.tmp.name), "http://127.0.0.1:1")
         self.gateway = Gateway(cfg, log=lambda *_args: None)
         self.gateway.pool = mock.Mock()
-        self.account = SimpleNamespace(session="fixture-session")
+        self.account = SimpleNamespace(session="fixture-session", proxy="")
         self.gateway.pool.acquire.return_value = self.account
         self.live_models = [{"id": "live-model-fixture", "name": "Live fixture"}]
         self.gateway.models_client.models = mock.Mock(
@@ -44,7 +44,7 @@ class ModelRefreshRecoveryTestCase(unittest.TestCase):
         self.assertEqual(self.run_refresh_cycles(1), [60, 24 * 3600])
         self.assertEqual(self.gateway.catalogue(), self.live_models)
         self.gateway.models_client.models.assert_called_once_with(
-            self.account.session)
+            self.account.session, proxy=None)
         self.gateway.pool.release.assert_called_once_with(self.account)
 
     def test_failed_recovery_keeps_fallback_and_short_retry(self):

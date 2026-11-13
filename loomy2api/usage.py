@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 import time
 from collections import deque
@@ -63,7 +65,8 @@ def extract_numbers(usage: Optional[Dict[str, Any]]) -> Dict[str, int]:
 
 class UsageLedger:
     def __init__(self, max_entries: int = DEFAULT_MAX_ENTRIES,
-                 persist_path: Optional[Path] = None):
+                 persist_path: Optional[Path] = None, *,
+                 legacy_path: Optional[Path] = None, logger=None):
         self.max_entries = max(10, int(max_entries))
         self._entries: Deque[Dict[str, Any]] = deque(maxlen=self.max_entries)
         self._lock = threading.Lock()
@@ -71,6 +74,13 @@ class UsageLedger:
         #: 落盘：网关重启频繁，内存台账会让「用量」页时不时清零，
         #: 用户看到的统计自然是错的。JSON 行文件，逐条追加。
         self._persist_path = persist_path
+        self._persist_lock = threading.Lock()
+        self._logger = logger
+        self._persist_warned = False
+        self._pending_legacy = None
+        if persist_path and legacy_path and persist_path != legacy_path:
+            if not self._migrate(legacy_path):
+                self._pending_legacy = legacy_path
         self._load()
 
     # ------------------------------------------------------------ record
@@ -104,7 +114,10 @@ class UsageLedger:
         if not self._persist_path:
             return
         try:
-            with open(self._persist_path, "r", encoding="utf-8") as fh:
+            source = self._persist_path
+            if self._pending_legacy and not source.exists():
+                source = self._pending_legacy
+            with open(source, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if not line:
@@ -118,16 +131,62 @@ class UsageLedger:
         except OSError:
             pass
 
+    def _warn_persist(self, exc: OSError) -> None:
+        if self._persist_warned:
+            return
+        self._persist_warned = True
+        message = f"Usage history persistence failed: {exc}"
+        if self._logger:
+            self._logger(message, level="WARN")
+        else:
+            import warnings
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
+
+    def _migrate(self, legacy_path: Path) -> bool:
+        """Copy legacy history once without deleting or overwriting either file."""
+        temporary = None
+        try:
+            if self._persist_path.exists() or not legacy_path.is_file():
+                return True
+            data = legacy_path.read_bytes()
+            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=self._persist_path.parent,
+                                             prefix=".usage-", delete=False) as fh:
+                temporary = Path(fh.name)
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            # Publish a fully written inode without replacing a concurrent target.
+            os.link(temporary, self._persist_path)
+            return True
+        except FileExistsError:
+            return True
+        except OSError as exc:
+            self._warn_persist(exc)
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError as exc:
+                    self._warn_persist(exc)
+
     def _append_persist(self, entry: Dict[str, Any]) -> None:
         import json as _json
         if not self._persist_path:
             return
         try:
-            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self._persist_path, "a", encoding="utf-8") as fh:
-                fh.write(_json.dumps(entry, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+            with self._persist_lock:
+                # A new append must not create the target ahead of failed migration.
+                if self._pending_legacy:
+                    if not self._migrate(self._pending_legacy):
+                        return
+                    self._pending_legacy = None
+                self._persist_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._persist_path, "a", encoding="utf-8") as fh:
+                    fh.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            self._warn_persist(exc)
 
     # -------------------------------------------------------------- read
     def recent(self, limit: int = 100, *, account: str = "", model: str = "") -> List[Dict[str, Any]]:

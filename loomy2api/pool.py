@@ -544,11 +544,7 @@ class AccountPool:
         for acc in self.accounts:
             if not acc.enabled or acc.name in exclude:
                 continue
-            if not acc.healthy(now) or not acc.session:
-                continue
-            if acc.available == 0:                 # 额度确认为 0 → 不参与
-                continue
-            if model and acc.model_cooled(model, now):
+            if not acc.healthy_for_model(model, now) or acc.available == 0:
                 continue
             if self.inflight.full(acc.name):
                 continue
@@ -576,8 +572,8 @@ class AccountPool:
             bound = self.sticky.get(session_key_value)
             if bound and bound not in exclude:
                 acc = self.get(bound)
-                if acc is not None and acc.healthy(now) and acc.session_valid \
-                        and not self.inflight.full(acc.name):
+                if acc is not None and acc.healthy_for_model(model, now) \
+                        and acc.available != 0 and not self.inflight.full(acc.name):
                     try:
                         self.ensure_session(acc)
                     except PoolError as exc:
@@ -587,9 +583,10 @@ class AccountPool:
                                  f"解绑后重新选号：{exc}")
                         self.sticky.unbind(session_key_value, bound)
                     else:
-                        acc.last_used = now
-                        self.inflight.acquire(acc.name)
-                        return acc
+                        if self.inflight.try_acquire(acc.name):
+                            acc.last_used = now
+                            return acc
+                        self.sticky.unbind(session_key_value, bound)
                 else:
                     self.sticky.unbind(session_key_value, bound)
 
@@ -645,8 +642,12 @@ class AccountPool:
                 if session_key_value:
                     self.sticky.unbind(session_key_value, acc.name)
                 continue
+            # Candidate filtering is advisory: another request may have taken
+            # its last slot while ensure_session was running outside any lock.
+            if not self.inflight.try_acquire(acc.name):
+                remaining = [c for c in remaining if c.name != acc.name]
+                continue
             acc.last_used = now
-            self.inflight.acquire(acc.name)
             if session_key_value:
                 self.sticky.bind(session_key_value, acc.name)
             return acc

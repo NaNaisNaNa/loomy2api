@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -174,20 +175,31 @@ class Config(dict):
             raise ValueError("配置补丁必须是对象 / patch must be an object")
         path = self._file()
         current: Dict[str, Any] = {}
-        if path.exists():
-            try:
-                current = json.loads(path.read_text(encoding="utf-8")) or {}
-            except Exception:                           # noqa: BLE001
-                current = {}
+        existing_mode = None
+        try:
+            with path.open(encoding="utf-8") as source:
+                current = json.load(source)
+                existing_mode = stat.S_IMODE(os.fstat(source.fileno()).st_mode)
+        except FileNotFoundError:
+            pass  # Deliberately allow initialization when no config exists.
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("现有配置读取或解析失败，保存已取消 / "
+                             "existing config unreadable or invalid; save cancelled") from exc
         if not isinstance(current, dict):
-            current = {}
+            raise ValueError("现有配置必须是对象，保存已取消 / "
+                             "existing config must be an object; save cancelled")
         _deep_merge(current, {k: v for k, v in updates.items()
                               if not str(k).startswith("_")})
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, path)
+        try:
+            with tmp.open("w", encoding="utf-8") as target:
+                if existing_mode is not None:
+                    tmp.chmod(existing_mode)
+                json.dump(current, target, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
         self.reload()
         return [k for k in updates if k in self.RESTART_KEYS]
 

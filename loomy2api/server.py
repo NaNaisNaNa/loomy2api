@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 import uuid
+from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -21,8 +22,64 @@ from . import anthropic as anth
 from .panel import Panel
 from .pool import AccountPool, PoolError
 from .routing import session_key
-from .upstream import ModelGateway, sse_usage, human_usage
+from .upstream import ModelGateway, human_usage
 from .usage import UsageLedger
+from .model_metadata import normalize_model_metadata
+
+
+class _ClientDisconnected(ConnectionError):
+    pass
+
+
+class _StreamFailure(RuntimeError):
+    def __init__(self, message: str, status: int = 502):
+        super().__init__(message)
+        self.status = status
+
+
+def _read_available(response) -> bytes:
+    """Return available stream bytes without waiting to fill a 4096-byte read."""
+    return getattr(response, "read1", response.read)(4096)
+
+
+class _SSEState:
+    """Validate completion/error state without rewriting upstream chunks."""
+    def __init__(self):
+        self.completed = False
+        self.done = False
+        self.usage = {}
+
+    def observe(self, line: bytes):
+        if self.done or not line.startswith(b"data:"):
+            return None
+        payload = line[5:].strip()
+        if payload == b"[DONE]":
+            self.completed = self.done = True
+            return None
+        if not payload:
+            return None
+        try:
+            obj = json.loads(payload)
+        except (ValueError, UnicodeError) as exc:
+            raise _StreamFailure("Invalid upstream SSE JSON") from exc
+        if not isinstance(obj, dict):
+            raise _StreamFailure("Invalid upstream SSE event")
+        if "error" in obj:
+            error = obj["error"]
+            detail = error if isinstance(error, dict) else {}
+            status = detail.get("code")
+            if not isinstance(status, int) or not 400 <= status <= 599:
+                status = 502
+            raise _StreamFailure(str(detail.get("message") or error or "Upstream stream error"), status)
+        if any(c.get("finish_reason") for c in (obj.get("choices") or []) if isinstance(c, dict)):
+            self.completed = True
+        if isinstance(obj.get("usage"), dict):
+            self.usage.update(obj["usage"])
+        return obj
+
+    def finish(self):
+        if not self.completed:
+            raise _StreamFailure("Upstream stream ended before a completion marker")
 
 __all__ = ["Gateway", "serve"]
 
@@ -272,8 +329,9 @@ class Gateway:
         #: 请求级用量台账（面板「用量」页）
         self.usage = UsageLedger(
             int(cfg.get("usage_max_entries") or 500),
-            persist_path=Path(__file__).resolve().parent.parent / "state"
-            / "usage.jsonl")
+            persist_path=cfg.path("accounts_file", "accounts.json").parent / "usage.jsonl",
+            legacy_path=Path(__file__).resolve().parent.parent / "state" / "usage.jsonl",
+            logger=self.log)
 
     # -- model catalogue -------------------------------------------------
 
@@ -281,16 +339,12 @@ class Gateway:
         acc = None
         try:
             acc = self.pool.acquire()
-            payload = self.models_client.models(acc.session)
+            payload = self.models_client.models(acc.session, proxy=acc.proxy or None)
             data = payload.get("data") or []
             if not data:
                 raise ValueError("Upstream model catalogue is empty")
-            for m in data:
-                if isinstance(m, dict) and (m.get("multiplier") in (None, "", 0)):
-                    mm = re.search(r"(?:x|×)([0-9]+(?:\.[0-9]+)?)",
-                                   str(m.get("name") or ""), re.I)
-                    if mm:
-                        m["multiplier"] = float(mm.group(1))
+            data = [normalize_model_metadata(m) if isinstance(m, dict) else m
+                    for m in data]
             with self._models_lock:
                 self.models = data
                 self._models_from_upstream = True
@@ -679,6 +733,15 @@ class Handler(BaseHTTPRequestHandler):
                 path = "/v1" + path
         return path.rstrip("/") or "/"
 
+    def _safe_url(self) -> str:
+        """Remove supported credential parameters before logging or echoing URLs."""
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        parts = urlsplit(self.path)
+        secret_keys = {"api_key", "apikey", "key", "access_token"}
+        query = [(k, "[redacted]" if k.lower() in secret_keys else v)
+                 for k, v in parse_qsl(parts.query, keep_blank_values=True)]
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
     # --------------------------------------------------------------- auth
 
     def _presented_key(self) -> Tuple[str, str]:
@@ -738,12 +801,12 @@ class Handler(BaseHTTPRequestHandler):
             if _secret_equal(token, panel_pw):
                 return True
         if path.startswith("/api/panel/"):
-            self.gateway.log(f"[auth] 面板拒绝 {self.command} {self.path}")
+            self.gateway.log(f"[auth] 面板拒绝 {self.command} {self._safe_url()}")
             self._error(401, "请先登录面板 / panel login required",
                         "panel_auth_required")
             return False
         # never log the secret itself — just enough to see what arrived
-        self.gateway.log(f"[auth] 拒绝 {self.command} {self.path} ← {source} "
+        self.gateway.log(f"[auth] 拒绝 {self.command} {self._safe_url()} ← {source} "
                          f"token={self._mask(token)}")
         self._error(401, "无效的 API Key / invalid API key", "authentication_error")
         return False
@@ -803,6 +866,7 @@ class Handler(BaseHTTPRequestHandler):
         日志里会出现 ``[req:xxxxxxxx]``，错误响应里回传同一个 ID ——
         客户端贴过来的报错能直接对上网关日志里那几行。
         """
+        self._body_read = False
         rid = uuid.uuid4().hex[:8]
         self._req_id = rid
         try:
@@ -883,7 +947,7 @@ class Handler(BaseHTTPRequestHandler):
                                             self.gateway.cfg.RESTART_KEYS)})
             if path == "/favicon.ico":
                 return self._error(404, "no favicon")
-            return self._error(404, f"未知路径 / unknown path: {self.path}")
+            return self._error(404, f"未知路径 / unknown path: {self._safe_url()}")
         except PoolError as exc:
             return self._error(503, str(exc), "account_pool_error")
         except Exception as exc:                        # noqa: BLE001
@@ -913,7 +977,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._config_patch()
             if path.startswith("/api/panel/"):
                 return self._panel_api(path)
-            return self._error(404, f"未知路径 / unknown path: {self.path}")
+            return self._error(404, f"未知路径 / unknown path: {self._safe_url()}")
         except ValueError as exc:
             return self._error(400, str(exc))
         except PoolError as exc:
@@ -1087,46 +1151,50 @@ class Handler(BaseHTTPRequestHandler):
         gw = self.gateway
         raw = self._read_body()
         acc = gw.pool.acquire()
-        t0 = time.time()
-        status, headers, data = gw.models_client.call(
-            acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {})
-        # 记账：生图一次扣上百积分，之前完全不进台账，「用量」页自然是错的。
-        # points 在响应**顶层**（images/generations 无 usage 对象，实测）。
         try:
-            body = json.loads(data.decode("utf-8", "replace"))
-        except ValueError:
-            body = {}
-        points = body.get("points_consumed") if isinstance(body, dict) else None
-        if points is None and isinstance(body, dict):
-            points = (body.get("usage") or {}).get("points_consumed")
-        try:
-            req_model = str((json.loads(raw.decode("utf-8")) if raw else {})
-                            .get("model") or "")
-        except ValueError:
-            req_model = ""
-        if status >= 400:
-            # 带上 model：404（模型不存在）才能落进模型级冷却分支，
-            # 不至于把唯一账号打进 60s 短冷却。
-            gw.pool.report_failure(acc, status,
-                                   data[:200].decode("utf-8", "replace"),
-                                   model=req_model)
-        else:
-            gw.pool.report_success(acc)
-        gw.usage.record(account=acc.name, model=req_model or suffix,
-            status=status, usage={} if points is None
-            else {"points_consumed": int(points or 0)},
-            latency=time.time() - t0, kind="image" if "images" in suffix else "passthrough",
-            proxy=acc.proxy or "")
-        try:
-            self.send_response(status)
-            self.send_header("Content-Type",
-                             headers.get("Content-Type", "application/json"))
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError,
-                ConnectionAbortedError, TimeoutError):
-            self.close_connection = True
+            t0 = time.time()
+            status, headers, data = gw.models_client.call(
+                acc.session, suffix, json.loads(raw.decode("utf-8")) if raw else {},
+                proxy=acc.proxy or None)
+            # 记账：生图一次扣上百积分，之前完全不进台账，「用量」页自然是错的。
+            # points 在响应**顶层**（images/generations 无 usage 对象，实测）。
+            try:
+                body = json.loads(data.decode("utf-8", "replace"))
+            except ValueError:
+                body = {}
+            points = body.get("points_consumed") if isinstance(body, dict) else None
+            if points is None and isinstance(body, dict):
+                points = (body.get("usage") or {}).get("points_consumed")
+            try:
+                req_model = str((json.loads(raw.decode("utf-8")) if raw else {})
+                                .get("model") or "")
+            except ValueError:
+                req_model = ""
+            if status >= 400:
+                # 带上 model：404（模型不存在）才能落进模型级冷却分支，
+                # 不至于把唯一账号打进 60s 短冷却。
+                gw.pool.report_failure(acc, status,
+                                       data[:200].decode("utf-8", "replace"),
+                                       model=req_model)
+            else:
+                gw.pool.report_success(acc)
+            gw.usage.record(account=acc.name, model=req_model or suffix,
+                status=status, usage={} if points is None
+                else {"points_consumed": int(points or 0)},
+                latency=time.time() - t0, kind="image" if "images" in suffix else "passthrough",
+                proxy=acc.proxy or "")
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type",
+                                 headers.get("Content-Type", "application/json"))
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError,
+                    ConnectionAbortedError, TimeoutError):
+                self.close_connection = True
+        finally:
+            gw.pool.release(acc)
 
     # ---------------------------------------------------------- chat (core)
 
@@ -1186,23 +1254,19 @@ class Handler(BaseHTTPRequestHandler):
             model_out = ""
             created = int(time.time())
             buffer = b""
+            state = _SSEState()
             try:
                 while True:
-                    chunk = resp.read(4096)
-                    if not chunk:
-                        break
+                    chunk = _read_available(resp)
+                    eof = not chunk
                     buffer += chunk
+                    if eof and buffer:
+                        buffer += b"\n"
                     while b"\n" in buffer:
                         line, buffer = buffer.split(b"\n", 1)
                         line = line.strip()
-                        if not line.startswith(b"data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if payload == b"[DONE]":
-                            continue
-                        try:
-                            j = json.loads(payload.decode("utf-8"))
-                        except Exception:               # noqa: BLE001
+                        j = state.observe(line)
+                        if j is None:
                             continue
                         if j.get("id"):
                             rid = j["id"]
@@ -1230,14 +1294,19 @@ class Handler(BaseHTTPRequestHandler):
                                 slot["name"] += fn["name"]
                             if fn.get("arguments"):
                                 slot["args"] += fn["arguments"]
-            except (TimeoutError, ConnectionError, OSError) as exc:
-                # 上游流中断/单次 read 超时（stream_idle_timeout）：之前这里
-                # 没有 except，异常直接炸到外层 502 整单失败不换账号。
-                # 现在记 504 → continue failover 换账号重新聚合。
-                gw.log(f"[call] {acc.name} {model} 长任务流中断/超时：{exc} → 换账号重试")
-                last = (504, json.dumps({"error": {
-                    "message": f"上游流中断/超时（已换账号重试）: {exc}",
-                    "type": "upstream_error", "code": 504}},
+                    if eof or state.done:
+                        break
+                state.finish()
+            except (_StreamFailure, HTTPException, TimeoutError, ConnectionError, OSError) as exc:
+                status = getattr(exc, "status", 504 if isinstance(exc, TimeoutError) else 502)
+                reason = str(exc)
+                gw.log(f"[call] {acc.name} {model} upstream stream failed: {reason}")
+                gw.pool.report_failure(acc, status, reason, model=model)
+                gw.usage.record(account=acc.name, model=model, status=status,
+                                latency=time.time() - started, kind="chat",
+                                error=reason, proxy=acc.proxy)
+                last = (status, json.dumps({"error": {
+                    "message": reason, "type": "upstream_error", "code": status}},
                     ensure_ascii=False).encode("utf-8"))
                 continue
             finally:
@@ -1394,7 +1463,12 @@ class Handler(BaseHTTPRequestHandler):
 
         # 伪流式：上游一次性返回，这里按 Responses SSE 事件序列下发。
         # 大多数客户端只需要事件帧结构，对逐 token 真流式不做强依赖。
+        sequence_number = 0
+
         def _evt(name: str, payload: dict) -> bool:
+            nonlocal sequence_number
+            payload = dict(payload, type=name, sequence_number=sequence_number)
+            sequence_number += 1
             try:
                 self.wfile.write(
                     f"event: {name}\ndata: ".encode("utf-8")
@@ -1413,59 +1487,48 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
         self.close_connection = True
-        seq = resp.get("output") or []
-        in_prog = dict(resp, status="in_progress")
-        if not _evt("response.created", {"response": in_prog,
-                                         "sequence_number": 0}):
+        in_prog = dict(resp, status="in_progress", output=[], output_text="")
+        if not _evt("response.created", {"response": in_prog}):
             return
-        n = 1
-        text_all = ""
-        for item in seq:
-            if not _evt("response.output_item.added",
-                        {"output_index": seq.index(item), "item": item,
-                         "sequence_number": n}):
-                return
-            n += 1
-            if item.get("type") == "function_call":
-                if not _evt("response.function_call_arguments.delta",
-                            {"type": "function_call_arguments",
-                             "item_id": item.get("id"),
-                             "output_index": seq.index(item),
-                             "content_index": 0,
-                             "delta": item.get("arguments") or "",
-                             "sequence_number": n}):
-                    return
-                n += 1
+        for output_index, item in enumerate(resp.get("output") or []):
+            added = dict(item, status="in_progress")
             if item.get("type") == "message":
-                for part in item.get("content") or []:
+                added["content"] = []
+            elif item.get("type") == "function_call":
+                added["arguments"] = ""
+            if not _evt("response.output_item.added",
+                        {"output_index": output_index, "item": added}):
+                return
+            location = {"item_id": item.get("id"), "output_index": output_index}
+            if item.get("type") == "function_call":
+                args = item.get("arguments") or ""
+                if not _evt("response.function_call_arguments.delta",
+                            dict(location, delta=args)):
+                    return
+                if not _evt("response.function_call_arguments.done",
+                            dict(location, arguments=args, name=item.get("name") or "")):
+                    return
+            elif item.get("type") == "message":
+                for content_index, part in enumerate(item.get("content") or []):
                     if part.get("type") != "output_text":
                         continue
+                    loc = dict(location, content_index=content_index)
+                    if not _evt("response.content_part.added",
+                                dict(loc, part=dict(part, text=""))):
+                        return
                     text = part.get("text") or ""
                     for i in range(0, len(text), 64):
                         if not _evt("response.output_text.delta",
-                                    {"type": "output_text",
-                                     "text": text[i:i + 64],
-                                     "item_id": item.get("id"),
-                                     "output_index": seq.index(item),
-                                     "content_index": 0,
-                                     "sequence_number": n}):
+                                    dict(loc, delta=text[i:i + 64], logprobs=[])):
                             return
-                        n += 1
-                    text_all += text
-                    if not _evt("response.output_text.done",
-                                {"type": "output_text", "text": text,
-                                 "item_id": item.get("id"),
-                                 "output_index": seq.index(item),
-                                 "content_index": 0,
-                                 "sequence_number": n}):
+                    if not _evt("response.output_text.done", dict(loc, text=text, logprobs=[])):
                         return
-                    n += 1
+                    if not _evt("response.content_part.done", dict(loc, part=part)):
+                        return
             if not _evt("response.output_item.done",
-                        {"output_index": seq.index(item), "item": item,
-                         "sequence_number": n}):
+                        {"output_index": output_index, "item": item}):
                 return
-            n += 1
-        _evt("response.completed", {"response": resp, "sequence_number": n})
+        _evt("response.completed", {"response": resp})
 
     def _responses_from_chat(self, obj: Dict[str, Any],
                              model: str) -> Dict[str, Any]:
@@ -1802,8 +1865,8 @@ class Handler(BaseHTTPRequestHandler):
                 # 安全 failover 换账号。之前拿到 200 就发头转发，上游卡住时
                 # 客户端只能干等到自己超时（qwenpaw「老是卡死」实锤）。
                 try:
-                    first_chunk = resp.read(4096)
-                except (TimeoutError, ConnectionError, OSError) as exc:
+                    first_chunk = _read_available(resp)
+                except (HTTPException, TimeoutError, ConnectionError, OSError) as exc:
                     conn.close()
                     gw.pool.release(acc)
                     gw.log(f"[call] {acc.name} {model} stream 首字节超时/异常："
@@ -1855,40 +1918,38 @@ class Handler(BaseHTTPRequestHandler):
                                    "upstream_error")
 
         started = probe_started
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.close_connection = True
-
-        usage: Dict[str, Any] = {}
+        state = _SSEState()
+        usage = state.usage
         buffer = b""
-        # 首块已经在上面的探测里读出来了 —— 直接转发给客户端，别丢
-        if first_chunk:
-            self.wfile.write(first_chunk)
-            self.wfile.flush()
-            buffer += first_chunk
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                sse_usage(line.strip(), usage)
         try:
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                if first_chunk_at is None:
-                    first_chunk_at = time.time()
-                self.wfile.write(chunk)
-                self.wfile.flush()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.close_connection = True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                raise _ClientDisconnected() from exc
+            chunk = first_chunk
+            while chunk:
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                    raise _ClientDisconnected() from exc
                 buffer += chunk
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
-                    sse_usage(line.strip(), usage)
+                    state.observe(line.strip())
+                if state.done:
+                    break
+                chunk = _read_available(resp)
             if buffer:
-                sse_usage(buffer.strip(), usage)
+                state.observe(buffer.strip())
+            state.finish()
             elapsed = time.time() - started
             ttfb = (first_chunk_at - started) if first_chunk_at else elapsed
             gw.pool.report_success(acc, usage, model=model)
@@ -1898,7 +1959,7 @@ class Handler(BaseHTTPRequestHandler):
             gw.log(f"[call] {acc.name} {model} {elapsed:.1f}s http=200 "
                    f"{human_usage(usage)}{_rate(usage, elapsed)} "
                    f"ttfb={ttfb:.2f}s stream")
-        except (BrokenPipeError, ConnectionResetError):
+        except _ClientDisconnected:
             gw.log(f"[call] {acc.name} {model} client disconnected")
         except Exception as exc:                        # noqa: BLE001
             # 上游断流 / 读超时：记账 + 给客户端发**收尾帧**。之前这里直接
@@ -1906,17 +1967,18 @@ class Handler(BaseHTTPRequestHandler):
             # 消息体的情况下关闭了连接（分块读取不完整）」（qwenpaw 实锤）。
             gw.log(f"[call] {acc.name} {model} stream 中断："
                    f"{type(exc).__name__}: {exc} → 发收尾帧")
-            gw.usage.record(account=acc.name, model=model, status=0,
+            status = getattr(exc, "status", 504 if isinstance(exc, TimeoutError) else 502)
+            gw.pool.report_failure(acc, status, str(exc), model=model)
+            gw.usage.record(account=acc.name, model=model, status=status,
                             latency=time.time() - started, kind="chat",
                             error=str(exc), stream=True, proxy=acc.proxy)
             try:
                 tail = json.dumps({"error": {
                     "message": f"上游流中断（{type(exc).__name__}）"
                                f"/ upstream stream broken: {exc}",
-                    "type": "upstream_error", "code": 504}},
+                    "type": "upstream_error", "code": status}},
                     ensure_ascii=False).encode("utf-8")
-                self.wfile.write(b"data: " + tail + b"\n\n")
-                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.write(b"\n\ndata: " + tail + b"\n\n")
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass                                    # 客户端已走，无所谓
@@ -2044,7 +2106,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 conn, resp = gw.models_client.stream(
                     acc.session, "chat/completions", payload,
-                    proxy=acc.proxy or None)
+                    proxy=acc.proxy or None,
+                    timeout=float(gw.cfg.get("stream_idle_timeout") or 120))
             except Exception as exc:                    # noqa: BLE001
                 gw.pool.release(acc)
                 gw.log(f"[messages] {acc.name} {model} stream 连接异常：{exc}")
@@ -2083,45 +2146,53 @@ class Handler(BaseHTTPRequestHandler):
 
         translator = anth.StreamTranslator(model)
         first_chunk_at: Optional[float] = None
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "close")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.close_connection = True
-
         def emit(event: str, data: Dict[str, Any]) -> None:
-            self.wfile.write(
-                f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-                .encode("utf-8"))
-            self.wfile.flush()
+            try:
+                self.wfile.write(
+                    f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+                    .encode("utf-8"))
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                raise _ClientDisconnected() from exc
 
         buffer = b""
+        state = _SSEState()
         try:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.close_connection = True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                raise _ClientDisconnected() from exc
             for event, data in translator.start():
                 emit(event, data)
             while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                if first_chunk_at is None:
+                chunk = _read_available(resp)
+                eof = not chunk
+                if chunk and first_chunk_at is None:
                     first_chunk_at = time.time()
                 buffer += chunk
+                if eof and buffer:
+                    buffer += b"\n"
                 while b"\n" in buffer:
                     line, buffer = buffer.split(b"\n", 1)
                     line = line.strip()
-                    if not line.startswith(b"data:"):
+                    if line.startswith(b":"):
+                        emit("ping", {"type": "ping"})
                         continue
-                    body = line[5:].strip()
-                    if not body or body == b"[DONE]":
-                        continue
-                    try:
-                        obj = json.loads(body)
-                    except Exception:                   # noqa: BLE001
+                    obj = state.observe(line)
+                    if obj is None:
                         continue
                     for event, data in translator.feed(obj):
                         emit(event, data)
+                if eof or state.done:
+                    break
+            state.finish()
             for event, data in translator.finish():
                 emit(event, data)
             elapsed = time.time() - started
@@ -2133,11 +2204,18 @@ class Handler(BaseHTTPRequestHandler):
             gw.log(f"[messages] {acc.name} {model} {elapsed:.1f}s "
                    f"http=200 {human_usage(translator.usage)}"
                    f"{_rate(translator.usage, elapsed)} ttfb={ttfb:.2f}s stream")
-        except (BrokenPipeError, ConnectionResetError):
+        except _ClientDisconnected:
             gw.log(f"[messages] {acc.name} {model} client disconnected")
         except Exception as exc:                        # noqa: BLE001
             gw.log(f"[messages] {acc.name} {model} stream 异常：{exc}")
-            gw.usage.record(account=acc.name, model=model, status=0,
+            status = getattr(exc, "status", 504 if isinstance(exc, TimeoutError) else 502)
+            gw.pool.report_failure(acc, status, str(exc), model=model)
+            try:
+                emit("error", {"type": "error", "error": {
+                    "type": "api_error", "message": str(exc)}})
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            gw.usage.record(account=acc.name, model=model, status=status,
                             latency=time.time() - started, kind="messages",
                             error=str(exc), stream=True, proxy=acc.proxy)
         finally:

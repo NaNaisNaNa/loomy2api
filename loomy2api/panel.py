@@ -42,6 +42,7 @@ from . import constants as C
 from . import wechat
 from .account import Account, AccountError
 from .login_flow import LoginFlow
+from .model_metadata import normalize_model_metadata
 from .pool import PoolError
 
 __all__ = ["Panel"]
@@ -438,13 +439,9 @@ class Panel:
         for item in catalogue:
             if not isinstance(item, dict):
                 continue
+            item = normalize_model_metadata(item)
             name = str(item.get("name") or "")
             mult = item.get("multiplier")
-            if mult is None and "x" in name:
-                try:
-                    mult = float(name[name.rfind("x") + 1:].rstrip(")"))
-                except Exception:                       # noqa: BLE001
-                    mult = None
             caps = item.get("capabilities") or {}
             modalities = item.get("modalities") or caps.get("input_modalities") or []
             rows.append({
