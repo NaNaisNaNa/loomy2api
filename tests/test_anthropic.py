@@ -183,6 +183,29 @@ class TestStreamTranslator(unittest.TestCase):
         self.assertEqual(message_delta["usage"]["output_tokens"], 9)
         self.assertEqual(message_delta["delta"]["stop_reason"], "end_turn")
 
+    def test_stream_final_usage_preserves_upstream_input_totals(self):
+        cases = [
+            ({"prompt_tokens": 37, "completion_tokens": 9}, 37),
+            ({"prompt_tokens": 0, "completion_tokens": 9}, 0),
+            ({"completion_tokens": 9}, None),
+        ]
+        for final_usage, expected in cases:
+            with self.subTest(usage=final_usage):
+                chunks = [{"choices": [{"delta": {"content": "hi"},
+                                        "finish_reason": "stop"}]}]
+                if expected is not None:
+                    chunks.append({"choices": [], "usage": {"prompt_tokens": 2}})
+                chunks.append({"choices": [], "usage": final_usage})
+                events = self._run(chunks)
+                start = events[0][1]["message"]["usage"]
+                final = next(d["usage"] for e, d in events if e == "message_delta")
+                self.assertEqual(start["input_tokens"], 0)
+                self.assertEqual(final["output_tokens"], 9)
+                if expected is None:
+                    self.assertNotIn("input_tokens", final)
+                else:
+                    self.assertEqual(final["input_tokens"], expected)
+
     def test_stream_text_only(self):
         events = self._run([{"choices": [{"delta": {"content": "a"},
                                           "finish_reason": "length"}]}])

@@ -306,9 +306,14 @@ class StreamTranslator:
                     "type": "content_block_stop", "index": tool["index"]})
         stop_reason = {"length": "max_tokens", "tool_calls": "tool_use"}.get(
             self.finish_reason, "end_turn")
+        usage = {"output_tokens": self.usage.get("completion_tokens") or 0}
+        # Upstream supplies prompt usage at the end. Replace the initial
+        # placeholder with its actual cumulative total, including zero.
+        if self.usage.get("prompt_tokens") is not None:
+            usage["input_tokens"] = self.usage["prompt_tokens"]
         yield self._ev("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": self.usage.get("completion_tokens") or 0},
+            "usage": usage,
         })
         yield self._ev("message_stop", {"type": "message_stop"})
