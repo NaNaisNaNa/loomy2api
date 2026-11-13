@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from loomy2api.server import Handler
+from test_stream_lifecycle import Chunks, frame
 
 TEXT = "你好，Responses stream! " * 12
 TOOLS = [{"id": "call_weather", "type": "function", "function": {
@@ -24,6 +25,30 @@ def make_handler(content=TEXT, tools=(), stream=True, sink=None):
     chat = {"choices": [{"message": {"content": content, "tool_calls": tools}}],
             "usage": {"prompt_tokens": 7, "completion_tokens": 11, "total_tokens": 18}}
     h._chat_upstream = mock.Mock(return_value=(200, json.dumps(chat).encode()))
+    acc = SimpleNamespace(name="fixture", session="offline", proxy="http://account.invalid")
+    pool = SimpleNamespace(acquire=mock.Mock(return_value=acc), release=mock.Mock(),
+                           report_success=mock.Mock(), report_failure=mock.Mock())
+    chunks = []
+    for index, tool in enumerate(tools):
+        chunks.append(frame({"choices": [{"delta": {"tool_calls": [{
+            "index": index, "id": tool["id"], "function": {
+                "name": tool["function"]["name"], "arguments": ""}}]}}]}))
+        arguments = tool["function"]["arguments"]
+        middle = max(1, len(arguments) // 2)
+        for part in (arguments[:middle], arguments[middle:]):
+            chunks.append(frame({"choices": [{"delta": {"tool_calls": [{
+                "index": index, "function": {"arguments": part}}]}}]}))
+    for offset in range(0, len(content), 64):
+        chunks.append(frame({"choices": [{"delta": {"content": content[offset:offset + 64]}}]}))
+    chunks.extend([frame({"choices": [{"delta": {}, "finish_reason": "tool_calls" if tools else "stop"}]}),
+                   frame({"choices": [], "usage": chat["usage"]}), b"data: [DONE]\n\n"])
+    h.gateway.cfg = {"max_retries": 0}
+    h.gateway.pool = pool
+    h.gateway.log = mock.Mock()
+    h.gateway.usage = SimpleNamespace(record=mock.Mock())
+    h.gateway.models_client = SimpleNamespace(stream=mock.Mock(return_value=(
+        SimpleNamespace(close=mock.Mock()), Chunks(chunks))))
+    h._error = mock.Mock()
     h.wfile = io.BytesIO() if sink is None else sink
     for name in ("send_response", "send_header", "end_headers", "_json"):
         setattr(h, name, mock.Mock())
@@ -33,7 +58,7 @@ def make_handler(content=TEXT, tools=(), stream=True, sink=None):
 class ResponsesStreamTestCase(unittest.TestCase):
     def consume(self, handler):
         frames = [block.split("\ndata: ", 1)
-                  for block in handler.wfile.getvalue().decode().split("\n\n") if block]
+                  for block in handler.wfile.getvalue().decode().split("\n\n") if block and not block.startswith(":")]
         events = [(header.removeprefix("event: "), json.loads(data))
                   for header, data in frames]
         self.assertEqual([e["sequence_number"] for _, e in events], list(range(len(events))))
@@ -48,8 +73,11 @@ class ResponsesStreamTestCase(unittest.TestCase):
                 self.assertEqual(snapshot["status"], "in_progress")
                 self.assertEqual(snapshot["output"], [])
                 self.assertEqual(snapshot["output_text"], "")
+            elif kind == "response.in_progress":
+                self.assertEqual(snapshot, event["response"])
             elif kind == "response.completed":
                 snapshot["status"] = "completed"
+                snapshot["usage"] = event["response"]["usage"]
                 self.assertEqual(snapshot, event["response"])
             elif kind == "response.output_item.added":
                 item = copy.deepcopy(event["item"])
@@ -97,8 +125,8 @@ class ResponsesStreamTestCase(unittest.TestCase):
         self.assertGreater(len(deltas), 1)
         self.assertEqual("".join(deltas), TEXT)
         names = [name for name, _ in events]
-        self.assertEqual(names[:3], ["response.created", "response.output_item.added",
-                                    "response.content_part.added"])
+        self.assertEqual(names[:4], ["response.created", "response.in_progress",
+                                    "response.output_item.added", "response.content_part.added"])
         self.assertEqual(names[-4:], ["response.output_text.done", "response.content_part.done",
                                      "response.output_item.done", "response.completed"])
         h.send_header.assert_any_call("Content-Type", "text/event-stream; charset=utf-8")
@@ -112,14 +140,16 @@ class ResponsesStreamTestCase(unittest.TestCase):
                          ["function_call", "function_call", "message"])
         for index, tool in enumerate(TOOLS):
             item = response["output"][index]
-            self.assertEqual(item["id"], tool["id"])
+            self.assertTrue(item["id"].startswith("fc_"))
             self.assertEqual(item["call_id"], tool["id"])
             self.assertEqual(item["arguments"], tool["function"]["arguments"])
             self.assertEqual(json.loads(item["arguments"]), json.loads(tool["function"]["arguments"]))
         argument_events = [e for _, e in events if e["type"].startswith("response.function_call_arguments.")]
-        self.assertEqual([e["output_index"] for e in argument_events], [0, 0, 1, 1])
-        self.assertEqual([e["item_id"] for e in argument_events],
-                         [TOOLS[0]["id"]] * 2 + [TOOLS[1]["id"]] * 2)
+        for index, item in enumerate(response["output"][:2]):
+            events_for_tool = [e for e in argument_events if e["output_index"] == index]
+            self.assertTrue(all(e["item_id"] == item["id"] for e in events_for_tool))
+            self.assertEqual("".join(e["delta"] for e in events_for_tool if "delta" in e),
+                             TOOLS[index]["function"]["arguments"])
         self.assertTrue(all(e["output_index"] == 2 for _, e in events
                             if e["type"].startswith("response.output_text.")))
 
@@ -130,7 +160,16 @@ class ResponsesStreamTestCase(unittest.TestCase):
             plain._responses()
             streamed._responses()
         final, _ = self.consume(streamed)
-        plain._json.assert_called_once_with(200, final)
+        plain._json.assert_called_once()
+        self.assertEqual(plain._json.call_args.args[0], 200)
+        original = plain._json.call_args.args[1]
+        for key in ("model", "usage", "output_text", "status"):
+            self.assertEqual(original[key], final[key])
+        for left, right in zip(original["output"], final["output"]):
+            self.assertEqual({k: v for k, v in left.items() if k != "id"},
+                             {k: v for k, v in right.items() if k != "id"})
+        plain.gateway.models_client.stream.assert_not_called()
+        streamed._chat_upstream.assert_not_called()
         plain.send_response.assert_not_called()
         self.assertEqual(plain.wfile.getvalue(), b"")
         self.assertEqual(final["usage"]["total_tokens"], 18)
@@ -140,7 +179,7 @@ class ResponsesStreamTestCase(unittest.TestCase):
         h._responses()
         final, events = self.consume(h)
         self.assertEqual(final["output"], [])
-        self.assertEqual(len(events), 2)
+        self.assertEqual(len(events), 3)
 
     def test_disconnect_stops_at_each_write_or_flush_boundary(self):
         reference = make_handler(tools=TOOLS)
@@ -157,6 +196,8 @@ class ResponsesStreamTestCase(unittest.TestCase):
                         self.assertEqual(sink.write.call_count, fail_at)
                         self.assertEqual(sink.flush.call_count, fail_at - (operation == "write"))
                         self.assertTrue(h.close_connection)
+                        h.gateway.pool.release.assert_called_once()
+                        h.gateway.pool.report_failure.assert_not_called()
 
 
 if __name__ == "__main__":

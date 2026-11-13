@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import os
+import queue
 import socket
 import threading
 import time
@@ -19,12 +20,16 @@ from typing import Any, Dict, Optional, Tuple
 
 from . import constants as C
 from . import anthropic as anth
+from . import responses
 from .panel import Panel
 from .pool import AccountPool, PoolError
 from .routing import session_key
 from .upstream import ModelGateway, human_usage
 from .usage import UsageLedger
 from .model_metadata import normalize_model_metadata
+
+
+_RESPONSES_HEARTBEAT_SECONDS = 15.0
 
 
 class _ClientDisconnected(ConnectionError):
@@ -1347,10 +1352,8 @@ class Handler(BaseHTTPRequestHandler):
     def _responses(self) -> None:
         """OpenAI Responses API（``/v1/responses``）最小兼容层。
 
-        上游只有 chat/completions；这里把 Responses 请求转成 chat 请求调
-        上游，再把结果包回 Responses 形状（非流式直接回 JSON；流式用
-        SSE 事件流伪流式下发）。之前该路径直接 404，带 key 的客户端
-        （如 Codex CLI）每打一次就是一条 WARN + 404。
+        将请求转成上游 Chat 格式；非流式保持聚合 JSON，
+        stream=true 增量转换 SSE，不等待完整生成结果。
         """
         gw = self.gateway
         req = self._read_json()
@@ -1442,6 +1445,8 @@ class Handler(BaseHTTPRequestHandler):
             chat_req["reasoning_effort"] = req["reasoning_effort"]
 
         self._maybe_compress(chat_req, model)
+        if req.get("stream"):
+            return self._responses_stream(chat_req, model)
         status, data = self._chat_upstream(chat_req, model, tag="responses")
         if status != 200:
             try:
@@ -1458,77 +1463,193 @@ class Handler(BaseHTTPRequestHandler):
                                "upstream_error")
         resp = self._responses_from_chat(obj, model)
 
-        if not req.get("stream"):
-            return self._json(200, resp)
+        return self._json(200, resp)
 
-        # 伪流式：上游一次性返回，这里按 Responses SSE 事件序列下发。
-        # 大多数客户端只需要事件帧结构，对逐 token 真流式不做强依赖。
-        sequence_number = 0
-
-        def _evt(name: str, payload: dict) -> bool:
-            nonlocal sequence_number
-            payload = dict(payload, type=name, sequence_number=sequence_number)
-            sequence_number += 1
+    def _responses_stream(self, payload: Dict[str, Any], model: str) -> None:
+        """Translate upstream Chat SSE live, with an independent heartbeat clock."""
+        gw = self.gateway
+        payload = dict(payload, stream=True)
+        payload["stream_options"] = dict(payload.get("stream_options") or {}, include_usage=True)
+        tried = []
+        last_status, last_error = 503, "No usable account"
+        acc = conn = resp = None
+        started = time.time()
+        for _ in range(int(gw.cfg.get("max_retries") or 0) + 1):
             try:
-                self.wfile.write(
-                    f"event: {name}\ndata: ".encode("utf-8")
-                    + json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                    + b"\n\n")
-                self.wfile.flush()
-                return True
-            except (BrokenPipeError, ConnectionResetError,
-                    ConnectionAbortedError, TimeoutError):
-                self.close_connection = True
-                return False
+                acc = gw.pool.acquire(exclude=list(tried), model=model)
+            except PoolError as exc:
+                if not tried:
+                    last_error = str(exc)
+                break
+            tried.append(acc.name)
+            try:
+                conn, resp = gw.models_client.stream(
+                    acc.session, "chat/completions", payload,
+                    proxy=acc.proxy or None,
+                    timeout=float(gw.cfg.get("stream_idle_timeout") or 120))
+                if resp.status == 200:
+                    break
+                last_status = resp.status
+                last_error = resp.read()[:500].decode("utf-8", "replace")
+            except Exception as exc:  # connection failures precede client SSE
+                last_status = 504 if isinstance(exc, TimeoutError) else 502
+                last_error = str(exc)
+            try:
+                gw.pool.report_failure(acc, last_status, last_error, model=model)
+                gw.usage.record(account=acc.name, model=model, status=last_status,
+                                kind="responses", error=last_error, stream=True,
+                                latency=time.time() - started, proxy=acc.proxy)
+            finally:
+                try:
+                    if conn is not None:
+                        conn.close()
+                finally:
+                    gw.pool.release(acc)
+                conn = resp = None
+            if last_status in self.FATAL_REQUEST:
+                break
+        if resp is None:
+            return self._error(last_status, last_error, "upstream_error")
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("X-Accel-Buffering", "no")
-        self.end_headers()
-        self.close_connection = True
-        in_prog = dict(resp, status="in_progress", output=[], output_text="")
-        if not _evt("response.created", {"response": in_prog}):
-            return
-        for output_index, item in enumerate(resp.get("output") or []):
-            added = dict(item, status="in_progress")
-            if item.get("type") == "message":
-                added["content"] = []
-            elif item.get("type") == "function_call":
-                added["arguments"] = ""
-            if not _evt("response.output_item.added",
-                        {"output_index": output_index, "item": added}):
-                return
-            location = {"item_id": item.get("id"), "output_index": output_index}
-            if item.get("type") == "function_call":
-                args = item.get("arguments") or ""
-                if not _evt("response.function_call_arguments.delta",
-                            dict(location, delta=args)):
-                    return
-                if not _evt("response.function_call_arguments.done",
-                            dict(location, arguments=args, name=item.get("name") or "")):
-                    return
-            elif item.get("type") == "message":
-                for content_index, part in enumerate(item.get("content") or []):
-                    if part.get("type") != "output_text":
-                        continue
-                    loc = dict(location, content_index=content_index)
-                    if not _evt("response.content_part.added",
-                                dict(loc, part=dict(part, text=""))):
+        translator = responses.StreamTranslator(model)
+        state = _SSEState()
+        chunks = queue.Queue(maxsize=16)
+        stopped = threading.Event()
+        reader = None
+        first_chunk_at = None
+        last_write = time.monotonic()
+
+        def write(data):
+            nonlocal last_write
+            try:
+                self.wfile.write(data)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                raise _ClientDisconnected() from exc
+            last_write = time.monotonic()
+
+        def emit(event):
+            write(("event: " + event["type"] + "\ndata: "
+                   + json.dumps(event, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+        def put(value):
+            while not stopped.is_set():
+                try:
+                    chunks.put(value, timeout=0.1)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def read():
+            try:
+                while not stopped.is_set():
+                    block = _read_available(resp)
+                    if not put(block) or not block:
                         return
-                    text = part.get("text") or ""
-                    for i in range(0, len(text), 64):
-                        if not _evt("response.output_text.delta",
-                                    dict(loc, delta=text[i:i + 64], logprobs=[])):
-                            return
-                    if not _evt("response.output_text.done", dict(loc, text=text, logprobs=[])):
-                        return
-                    if not _evt("response.content_part.done", dict(loc, part=part)):
-                        return
-            if not _evt("response.output_item.done",
-                        {"output_index": output_index, "item": item}):
-                return
-        _evt("response.completed", {"response": resp})
+            except Exception as exc:
+                put(exc)
+
+        def observe(line):
+            obj = state.observe(line.strip())
+            if obj is not None:
+                for event in translator.feed(obj):
+                    emit(event)
+
+        try:
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.close_connection = True
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError) as exc:
+                raise _ClientDisconnected() from exc
+            for event in translator.start():
+                emit(event)
+            reader = threading.Thread(target=read, name="responses-upstream", daemon=True)
+            reader.start()
+            buffer = b""
+            while not state.done:
+                remaining = _RESPONSES_HEARTBEAT_SECONDS - (time.monotonic() - last_write)
+                if remaining <= 0:
+                    write(b": keepalive\n\n")
+                    continue
+                try:
+                    block = chunks.get(timeout=remaining)
+                except queue.Empty:
+                    continue
+                if isinstance(block, Exception):
+                    raise block
+                if not block:
+                    break
+                if first_chunk_at is None:
+                    first_chunk_at = time.time()
+                buffer += block
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    observe(line)
+                    if state.done:
+                        break
+            if buffer and not state.done:
+                observe(buffer)
+            state.finish()
+            for event in translator.finish(state.usage):
+                emit(event)
+            elapsed = time.time() - started
+            gw.pool.report_success(acc, state.usage, model=model)
+            gw.usage.record(account=acc.name, model=model, status=200, usage=state.usage,
+                            latency=elapsed, ttfb=(first_chunk_at - started) if first_chunk_at else elapsed,
+                            stream=True, kind="responses", proxy=acc.proxy)
+            gw.log(f"[responses] {acc.name} {model} {elapsed:.1f}s http=200 "
+                   f"{human_usage(state.usage)} stream")
+        except _ClientDisconnected:
+            gw.usage.record(account=acc.name, model=model, status=499, usage=state.usage,
+                            latency=time.time() - started, kind="responses", stream=True,
+                            error="client disconnected", proxy=acc.proxy)
+        except Exception as exc:
+            status = getattr(exc, "status", 504 if isinstance(exc, TimeoutError) else 502)
+            gw.pool.report_failure(acc, status, str(exc), model=model)
+            gw.usage.record(account=acc.name, model=model, status=status, usage=state.usage,
+                            latency=time.time() - started, kind="responses", stream=True,
+                            error=str(exc), proxy=acc.proxy)
+            gw.log(f"[responses] {acc.name} {model} stream failed: {type(exc).__name__}")
+            try:
+                emit(translator.fail(str(exc), state.usage))
+            except _ClientDisconnected:
+                pass
+        finally:
+            stopped.set()
+            # HTTPResponse may own the socket after a Connection: close header.
+            sock = getattr(conn, "sock", None)
+            if sock is None:
+                raw = getattr(getattr(resp, "fp", None), "raw", None)
+                sock = getattr(raw, "_sock", None)
+            try:
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    finally:
+                        # SocketIO keeps a reference after socket.close(); on
+                        # Windows shutdown alone may not interrupt recv. Detach
+                        # before closing the handle to avoid a later double close.
+                        if isinstance(sock, socket.socket):
+                            socket.close(sock.detach())
+            except OSError:
+                pass
+            try:
+                conn.close()
+                if reader is not None and reader.ident is not None:
+                    reader.join(timeout=1)
+                if reader is None or not reader.is_alive():
+                    close = getattr(resp, "close", None)
+                    if close is not None:
+                        close()
+            finally:
+                gw.pool.release(acc)
 
     def _responses_from_chat(self, obj: Dict[str, Any],
                              model: str) -> Dict[str, Any]:
