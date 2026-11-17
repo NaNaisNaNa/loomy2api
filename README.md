@@ -38,6 +38,14 @@ python -m loomy2api serve          # http://127.0.0.1:17890
 
 面板 →「添加账号」→ 短信验证码登录，账号自动入池并持久化。
 
+## 出口代理
+
+面板支持全局代理和账号代理，账号配置优先。可填 `http://host:port`、
+`socks5://host:port` 或 `socks5h://host:port`；省略端口时分别使用 80、1080、1080。
+两种 SOCKS5 地址都由代理解析目标域名；HTTP/HTTPS 请求与流式响应均使用同一代理。
+需要认证时可写 `scheme://user:password@host:port`，特殊字符须使用 URL 百分号编码。
+HTTPS 目标仍校验目标服务器证书；`https://` 代理传输暂不支持。代理失败会直接报错。
+
 ## 计费（逆向实测）
 
 - 对话：每次保底 1 分；输出超过 `1000/倍率` token 后按 `ceil(completion/1000 × 倍率)` 加收
